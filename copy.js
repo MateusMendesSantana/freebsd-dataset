@@ -1,7 +1,7 @@
 const fs = require('fs');
 
-const freebsdPath = 'C:/Users/x/Documents/projects/freebsd';
-const output = './12'
+const freebsdPath = '/mnt/ddbfa0de-ddc0-4f61-9bf3-7e162c08248d/Projetos/Estudos/Ucsal/Evolução de Software/freebsd/';
+const output = './1'
 const files = [
   'sys/kern/vfs_subr.c',
   'sys/amd64/amd64/pmap.c',

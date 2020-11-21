@@ -112,7 +112,8 @@ static void	vgonel(struct vnode *);
 static bool	vhold_recycle_free(struct vnode *);
 static void	vfs_knllock(void *arg);
 static void	vfs_knlunlock(void *arg);
-static void	vfs_knl_assert_lock(void *arg, int what);
+static void	vfs_knl_assert_locked(void *arg);
+static void	vfs_knl_assert_unlocked(void *arg);
 static void	destroy_vpollinfo(struct vpollinfo *vi);
 static int	v_inval_buf_range_locked(struct vnode *vp, struct bufobj *bo,
 		    daddr_t startlbn, daddr_t endlbn);
@@ -734,18 +735,17 @@ SYSINIT(vfs, SI_SUB_VFS, SI_ORDER_FIRST, vntblinit, NULL);
 int
 vfs_busy(struct mount *mp, int flags)
 {
-	struct mount_pcpu *mpcpu;
 
 	MPASS((flags & ~MBF_MASK) == 0);
 	CTR3(KTR_VFS, "%s: mp %p with flags %d", __func__, mp, flags);
 
-	if (vfs_op_thread_enter(mp, mpcpu)) {
+	if (vfs_op_thread_enter(mp)) {
 		MPASS((mp->mnt_kern_flag & MNTK_DRAINING) == 0);
 		MPASS((mp->mnt_kern_flag & MNTK_UNMOUNT) == 0);
 		MPASS((mp->mnt_kern_flag & MNTK_REFEXPIRE) == 0);
-		vfs_mp_count_add_pcpu(mpcpu, ref, 1);
-		vfs_mp_count_add_pcpu(mpcpu, lockref, 1);
-		vfs_op_thread_exit(mp, mpcpu);
+		vfs_mp_count_add_pcpu(mp, ref, 1);
+		vfs_mp_count_add_pcpu(mp, lockref, 1);
+		vfs_op_thread_exit(mp);
 		if (flags & MBF_MNTLSTLOCK)
 			mtx_unlock(&mountlist_mtx);
 		return (0);
@@ -795,16 +795,15 @@ vfs_busy(struct mount *mp, int flags)
 void
 vfs_unbusy(struct mount *mp)
 {
-	struct mount_pcpu *mpcpu;
 	int c;
 
 	CTR2(KTR_VFS, "%s: mp %p", __func__, mp);
 
-	if (vfs_op_thread_enter(mp, mpcpu)) {
+	if (vfs_op_thread_enter(mp)) {
 		MPASS((mp->mnt_kern_flag & MNTK_DRAINING) == 0);
-		vfs_mp_count_sub_pcpu(mpcpu, lockref, 1);
-		vfs_mp_count_sub_pcpu(mpcpu, ref, 1);
-		vfs_op_thread_exit(mp, mpcpu);
+		vfs_mp_count_sub_pcpu(mp, lockref, 1);
+		vfs_mp_count_sub_pcpu(mp, ref, 1);
+		vfs_op_thread_exit(mp);
 		return;
 	}
 
@@ -4812,7 +4811,7 @@ v_addpollinfo(struct vnode *vp)
 	vi = malloc(sizeof(*vi), M_VNODEPOLL, M_WAITOK | M_ZERO);
 	mtx_init(&vi->vpi_lock, "vnode pollinfo", NULL, MTX_DEF);
 	knlist_init(&vi->vpi_selinfo.si_note, vp, vfs_knllock,
-	    vfs_knlunlock, vfs_knl_assert_lock);
+	    vfs_knlunlock, vfs_knl_assert_locked, vfs_knl_assert_unlocked);
 	VI_LOCK(vp);
 	if (vp->v_pollinfo != NULL) {
 		VI_UNLOCK(vp);
@@ -6061,15 +6060,22 @@ vfs_knlunlock(void *arg)
 }
 
 static void
-vfs_knl_assert_lock(void *arg, int what)
+vfs_knl_assert_locked(void *arg)
 {
 #ifdef DEBUG_VFS_LOCKS
 	struct vnode *vp = arg;
 
-	if (what == LA_LOCKED)
-		ASSERT_VOP_LOCKED(vp, "vfs_knl_assert_locked");
-	else
-		ASSERT_VOP_UNLOCKED(vp, "vfs_knl_assert_unlocked");
+	ASSERT_VOP_LOCKED(vp, "vfs_knl_assert_locked");
+#endif
+}
+
+static void
+vfs_knl_assert_unlocked(void *arg)
+{
+#ifdef DEBUG_VFS_LOCKS
+	struct vnode *vp = arg;
+
+	ASSERT_VOP_UNLOCKED(vp, "vfs_knl_assert_unlocked");
 #endif
 }
 
@@ -6401,19 +6407,18 @@ restart:
 int
 vfs_cache_root(struct mount *mp, int flags, struct vnode **vpp)
 {
-	struct mount_pcpu *mpcpu;
 	struct vnode *vp;
 	int error;
 
-	if (!vfs_op_thread_enter(mp, mpcpu))
+	if (!vfs_op_thread_enter(mp))
 		return (vfs_cache_root_fallback(mp, flags, vpp));
 	vp = atomic_load_ptr(&mp->mnt_rootvnode);
 	if (vp == NULL || VN_IS_DOOMED(vp)) {
-		vfs_op_thread_exit(mp, mpcpu);
+		vfs_op_thread_exit(mp);
 		return (vfs_cache_root_fallback(mp, flags, vpp));
 	}
 	vrefact(vp);
-	vfs_op_thread_exit(mp, mpcpu);
+	vfs_op_thread_exit(mp);
 	error = vn_lock(vp, flags);
 	if (error != 0) {
 		vrele(vp);

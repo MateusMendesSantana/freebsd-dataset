@@ -1,6 +1,4 @@
 /*-
- * SPDX-License-Identifier: BSD-3-Clause
- *
  * Copyright (c) 1982, 1986, 1988, 1990, 1993, 1994, 1995
  *	The Regents of the University of California.  All rights reserved.
  * Copyright (c) 2007-2008,2010
@@ -58,7 +56,6 @@ __FBSDID("$FreeBSD$");
 #include "opt_tcpdebug.h"
 
 #include <sys/param.h>
-#include <sys/arb.h>
 #include <sys/kernel.h>
 #ifdef TCP_HHOOK
 #include <sys/hhook.h>
@@ -67,7 +64,6 @@ __FBSDID("$FreeBSD$");
 #include <sys/mbuf.h>
 #include <sys/proc.h>		/* for proc0 declaration */
 #include <sys/protosw.h>
-#include <sys/qmath.h>
 #include <sys/sdt.h>
 #include <sys/signalvar.h>
 #include <sys/socket.h>
@@ -75,7 +71,6 @@ __FBSDID("$FreeBSD$");
 #include <sys/sysctl.h>
 #include <sys/syslog.h>
 #include <sys/systm.h>
-#include <sys/stats.h>
 
 #include <machine/cpu.h>	/* before tcp_seq.h, for tcp_random18() */
 
@@ -103,16 +98,17 @@ __FBSDID("$FreeBSD$");
 #include <netinet6/in6_var.h>
 #include <netinet6/ip6_var.h>
 #include <netinet6/nd6.h>
+#ifdef TCP_RFC7413
+#include <netinet/tcp_fastopen.h>
+#endif
 #include <netinet/tcp.h>
 #include <netinet/tcp_fsm.h>
-#include <netinet/tcp_log_buf.h>
 #include <netinet/tcp_seq.h>
 #include <netinet/tcp_timer.h>
 #include <netinet/tcp_var.h>
 #include <netinet6/tcp6_var.h>
 #include <netinet/tcpip.h>
 #include <netinet/cc/cc.h>
-#include <netinet/tcp_fastopen.h>
 #ifdef TCPPCAP
 #include <netinet/tcp_pcap.h>
 #endif
@@ -132,9 +128,9 @@ __FBSDID("$FreeBSD$");
 
 const int tcprexmtthresh = 3;
 
-VNET_DEFINE(int, tcp_log_in_vain) = 0;
-SYSCTL_INT(_net_inet_tcp, OID_AUTO, log_in_vain, CTLFLAG_VNET | CTLFLAG_RW,
-    &VNET_NAME(tcp_log_in_vain), 0,
+int tcp_log_in_vain = 0;
+SYSCTL_INT(_net_inet_tcp, OID_AUTO, log_in_vain, CTLFLAG_RW,
+    &tcp_log_in_vain, 0,
     "Log all incoming TCP segments to closed ports");
 
 VNET_DEFINE(int, blackhole) = 0;
@@ -152,11 +148,6 @@ VNET_DEFINE(int, drop_synfin) = 0;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, drop_synfin, CTLFLAG_VNET | CTLFLAG_RW,
     &VNET_NAME(drop_synfin), 0,
     "Drop TCP packets with SYN+FIN set");
-
-VNET_DEFINE(int, tcp_do_newcwv) = 0;
-SYSCTL_INT(_net_inet_tcp, OID_AUTO, newcwv, CTLFLAG_VNET | CTLFLAG_RW,
-    &VNET_NAME(tcp_do_newcwv), 0,
-    "Enable New Congestion Window Validation per RFC7661");
 
 VNET_DEFINE(int, tcp_do_rfc6675_pipe) = 0;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, rfc6675_pipe, CTLFLAG_VNET | CTLFLAG_RW,
@@ -188,9 +179,7 @@ SYSCTL_INT(_net_inet_tcp, OID_AUTO, abc_l_var, CTLFLAG_VNET | CTLFLAG_RW,
     &VNET_NAME(tcp_abc_l_var), 2,
     "Cap the max cwnd increment during slow-start to this number of segments");
 
-static SYSCTL_NODE(_net_inet_tcp, OID_AUTO, ecn,
-    CTLFLAG_RW | CTLFLAG_MPSAFE, 0,
-    "TCP ECN");
+static SYSCTL_NODE(_net_inet_tcp, OID_AUTO, ecn, CTLFLAG_RW, 0, "TCP ECN");
 
 VNET_DEFINE(int, tcp_do_ecn) = 2;
 SYSCTL_INT(_net_inet_tcp_ecn, OID_AUTO, enable, CTLFLAG_VNET | CTLFLAG_RW,
@@ -221,6 +210,11 @@ VNET_DEFINE(int, tcp_do_autorcvbuf) = 1;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, recvbuf_auto, CTLFLAG_VNET | CTLFLAG_RW,
     &VNET_NAME(tcp_do_autorcvbuf), 0,
     "Enable automatic receive buffer sizing");
+
+VNET_DEFINE(int, tcp_autorcvbuf_inc) = 16*1024;
+SYSCTL_INT(_net_inet_tcp, OID_AUTO, recvbuf_inc, CTLFLAG_VNET | CTLFLAG_RW,
+    &VNET_NAME(tcp_autorcvbuf_inc), 0,
+    "Incrementor step size of automatic receive buffer");
 
 VNET_DEFINE(int, tcp_autorcvbuf_max) = 2*1024*1024;
 SYSCTL_INT(_net_inet_tcp, OID_AUTO, recvbuf_max, CTLFLAG_VNET | CTLFLAG_RW,
@@ -266,14 +260,14 @@ VNET_SYSUNINIT(tcp_vnet_uninit, SI_SUB_PROTO_IFATTACHDOMAIN, SI_ORDER_ANY,
 #endif /* VIMAGE */
 
 /*
- * Kernel module interface for updating tcpstat.  The first argument is an index
+ * Kernel module interface for updating tcpstat.  The argument is an index
  * into tcpstat treated as an array.
  */
 void
-kmod_tcpstat_add(int statnum, int val)
+kmod_tcpstat_inc(int statnum)
 {
 
-	counter_u64_add(VNET(tcpstat)[statnum], val);
+	counter_u64_add(VNET(tcpstat)[statnum], 1);
 }
 
 #ifdef TCP_HHOOK
@@ -303,53 +297,19 @@ void
 cc_ack_received(struct tcpcb *tp, struct tcphdr *th, uint16_t nsegs,
     uint16_t type)
 {
-#ifdef STATS
-	int32_t gput;
-#endif
-
 	INP_WLOCK_ASSERT(tp->t_inpcb);
 
 	tp->ccv->nsegs = nsegs;
 	tp->ccv->bytes_this_ack = BYTES_THIS_ACK(tp, th);
-	if ((!V_tcp_do_newcwv && (tp->snd_cwnd <= tp->snd_wnd)) ||
-	    (V_tcp_do_newcwv && (tp->snd_cwnd <= tp->snd_wnd) &&
-	     (tp->snd_cwnd < (tcp_compute_pipe(tp) * 2))))
+	if (tp->snd_cwnd <= tp->snd_wnd)
 		tp->ccv->flags |= CCF_CWND_LIMITED;
 	else
 		tp->ccv->flags &= ~CCF_CWND_LIMITED;
 
 	if (type == CC_ACK) {
-#ifdef STATS
-		stats_voi_update_abs_s32(tp->t_stats, VOI_TCP_CALCFRWINDIFF,
-		    ((int32_t)tp->snd_cwnd) - tp->snd_wnd);
-		if (!IN_RECOVERY(tp->t_flags))
-			stats_voi_update_abs_u32(tp->t_stats, VOI_TCP_ACKLEN,
-			   tp->ccv->bytes_this_ack / (tcp_maxseg(tp) * nsegs));
-		if ((tp->t_flags & TF_GPUTINPROG) &&
-		    SEQ_GEQ(th->th_ack, tp->gput_ack)) {
-			/*
-			 * Compute goodput in bits per millisecond.
-			 */
-			gput = (((int64_t)(th->th_ack - tp->gput_seq)) << 3) /
-			    max(1, tcp_ts_getticks() - tp->gput_ts);
-			stats_voi_update_abs_u32(tp->t_stats, VOI_TCP_GPUT,
-			    gput);
-			/*
-			 * XXXLAS: This is a temporary hack, and should be
-			 * chained off VOI_TCP_GPUT when stats(9) grows an API
-			 * to deal with chained VOIs.
-			 */
-			if (tp->t_stats_gput_prev > 0)
-				stats_voi_update_abs_s32(tp->t_stats,
-				    VOI_TCP_GPUT_ND,
-				    ((gput - tp->t_stats_gput_prev) * 100) /
-				    tp->t_stats_gput_prev);
-			tp->t_flags &= ~TF_GPUTINPROG;
-			tp->t_stats_gput_prev = gput;
-		}
-#endif /* STATS */
 		if (tp->snd_cwnd > tp->snd_ssthresh) {
-			tp->t_bytes_acked += tp->ccv->bytes_this_ack;
+			tp->t_bytes_acked += min(tp->ccv->bytes_this_ack,
+			     nsegs * V_tcp_abc_l_var * tcp_maxseg(tp));
 			if (tp->t_bytes_acked >= tp->snd_cwnd) {
 				tp->t_bytes_acked -= tp->snd_cwnd;
 				tp->ccv->flags |= CCF_ABC_SENTAWND;
@@ -365,12 +325,9 @@ cc_ack_received(struct tcpcb *tp, struct tcphdr *th, uint16_t nsegs,
 		tp->ccv->curack = th->th_ack;
 		CC_ALGO(tp)->ack_received(tp->ccv, type);
 	}
-#ifdef STATS
-	stats_voi_update_abs_ulong(tp->t_stats, VOI_TCP_LCWIN, tp->snd_cwnd);
-#endif
 }
 
-void
+void 
 cc_conn_init(struct tcpcb *tp)
 {
 	struct hc_metrics_lite metrics;
@@ -413,14 +370,31 @@ cc_conn_init(struct tcpcb *tp)
 	/*
 	 * Set the initial slow-start flight size.
 	 *
+	 * RFC5681 Section 3.1 specifies the default conservative values.
+	 * RFC3390 specifies slightly more aggressive values.
+	 * RFC6928 increases it to ten segments.
+	 * Support for user specified value for initial flight size.
+	 *
 	 * If a SYN or SYN/ACK was lost and retransmitted, we have to
 	 * reduce the initial CWND to one segment as congestion is likely
 	 * requiring us to be cautious.
 	 */
 	if (tp->snd_cwnd == 1)
 		tp->snd_cwnd = maxseg;		/* SYN(-ACK) lost */
-	else
-		tp->snd_cwnd = tcp_compute_initwnd(maxseg);
+	else if (V_tcp_initcwnd_segments)
+		tp->snd_cwnd = min(V_tcp_initcwnd_segments * maxseg,
+		    max(2 * maxseg, V_tcp_initcwnd_segments * 1460));
+	else if (V_tcp_do_rfc3390)
+		tp->snd_cwnd = min(4 * maxseg, max(2 * maxseg, 4380));
+	else {
+		/* Per RFC5681 Section 3.1 */
+		if (maxseg > 2190)
+			tp->snd_cwnd = 2 * maxseg;
+		else if (maxseg > 1095)
+			tp->snd_cwnd = 3 * maxseg;
+		else
+			tp->snd_cwnd = 4 * maxseg;
+	}
 
 	if (CC_ALGO(tp)->conn_init != NULL)
 		CC_ALGO(tp)->conn_init(tp->ccv);
@@ -429,40 +403,34 @@ cc_conn_init(struct tcpcb *tp)
 void inline
 cc_cong_signal(struct tcpcb *tp, struct tcphdr *th, uint32_t type)
 {
-	INP_WLOCK_ASSERT(tp->t_inpcb);
+	u_int maxseg;
 
-#ifdef STATS
-	stats_voi_update_abs_u32(tp->t_stats, VOI_TCP_CSIG, type);
-#endif
+	INP_WLOCK_ASSERT(tp->t_inpcb);
 
 	switch(type) {
 	case CC_NDUPACK:
 		if (!IN_FASTRECOVERY(tp->t_flags)) {
 			tp->snd_recover = tp->snd_max;
-			if (tp->t_flags2 & TF2_ECN_PERMIT)
-				tp->t_flags2 |= TF2_ECN_SND_CWR;
+			if (tp->t_flags & TF_ECN_PERMIT)
+				tp->t_flags |= TF_ECN_SND_CWR;
 		}
 		break;
 	case CC_ECN:
-		if (!IN_CONGRECOVERY(tp->t_flags) ||
-		    /*
-		     * Allow ECN reaction on ACK to CWR, if
-		     * that data segment was also CE marked.
-		     */
-		    SEQ_GEQ(th->th_ack, tp->snd_recover)) {
-			EXIT_CONGRECOVERY(tp->t_flags);
+		if (!IN_CONGRECOVERY(tp->t_flags)) {
 			TCPSTAT_INC(tcps_ecn_rcwnd);
-			tp->snd_recover = tp->snd_max + 1;
-			if (tp->t_flags2 & TF2_ECN_PERMIT)
-				tp->t_flags2 |= TF2_ECN_SND_CWR;
+			tp->snd_recover = tp->snd_max;
+			if (tp->t_flags & TF_ECN_PERMIT)
+				tp->t_flags |= TF_ECN_SND_CWR;
 		}
 		break;
 	case CC_RTO:
+		maxseg = tcp_maxseg(tp);
 		tp->t_dupacks = 0;
 		tp->t_bytes_acked = 0;
 		EXIT_RECOVERY(tp->t_flags);
-		if (tp->t_flags2 & TF2_ECN_PERMIT)
-			tp->t_flags2 |= TF2_ECN_SND_CWR;
+		tp->snd_ssthresh = max(2, min(tp->snd_wnd, tp->snd_cwnd) / 2 /
+		    maxseg) * maxseg;
+		tp->snd_cwnd = maxseg;
 		break;
 	case CC_RTO_ERR:
 		TCPSTAT_INC(tcps_sndrexmitbad);
@@ -517,7 +485,7 @@ cc_post_recovery(struct tcpcb *tp, struct tcphdr *th)
 	    (tlen <= tp->t_maxseg) &&					\
 	    (V_tcp_delack_enabled || (tp->t_flags & TF_NEEDSYN)))
 
-void inline
+static void inline
 cc_ecnpkt_handler(struct tcpcb *tp, struct tcphdr *th, uint8_t iptos)
 {
 	INP_WLOCK_ASSERT(tp->t_inpcb);
@@ -525,15 +493,14 @@ cc_ecnpkt_handler(struct tcpcb *tp, struct tcphdr *th, uint8_t iptos)
 	if (CC_ALGO(tp)->ecnpkt_handler != NULL) {
 		switch (iptos & IPTOS_ECN_MASK) {
 		case IPTOS_ECN_CE:
-			tp->ccv->flags |= CCF_IPHDR_CE;
-			break;
+		    tp->ccv->flags |= CCF_IPHDR_CE;
+		    break;
 		case IPTOS_ECN_ECT0:
-			/* FALLTHROUGH */
+		    tp->ccv->flags &= ~CCF_IPHDR_CE;
+		    break;
 		case IPTOS_ECN_ECT1:
-			/* FALLTHROUGH */
-		case IPTOS_ECN_NOTECT:
-			tp->ccv->flags &= ~CCF_IPHDR_CE;
-			break;
+		    tp->ccv->flags &= ~CCF_IPHDR_CE;
+		    break;
 		}
 
 		if (th->th_flags & TH_CWR)
@@ -541,12 +508,15 @@ cc_ecnpkt_handler(struct tcpcb *tp, struct tcphdr *th, uint8_t iptos)
 		else
 			tp->ccv->flags &= ~CCF_TCPHDR_CWR;
 
+		if (tp->t_flags & TF_DELACK)
+			tp->ccv->flags |= CCF_DELACK;
+		else
+			tp->ccv->flags &= ~CCF_DELACK;
+
 		CC_ALGO(tp)->ecnpkt_handler(tp->ccv);
 
-		if (tp->ccv->flags & CCF_ACKNOW) {
+		if (tp->ccv->flags & CCF_ACKNOW)
 			tcp_timer_activate(tp, TT_DELACK, tcp_delacktime);
-			tp->t_flags |= TF_ACKNOW;
-		}
 	}
 }
 
@@ -563,19 +533,11 @@ cc_ecnpkt_handler(struct tcpcb *tp, struct tcphdr *th, uint8_t iptos)
 int
 tcp6_input(struct mbuf **mp, int *offp, int proto)
 {
-	struct mbuf *m;
+	struct mbuf *m = *mp;
 	struct in6_ifaddr *ia6;
 	struct ip6_hdr *ip6;
 
-	m = *mp;
-	if (m->m_len < *offp + sizeof(struct tcphdr)) {
-		m = m_pullup(m, *offp + sizeof(struct tcphdr));
-		if (m == NULL) {
-			*mp = m;
-			TCPSTAT_INC(tcps_rcvshort);
-			return (IPPROTO_DONE);
-		}
-	}
+	IP6_EXTHDR_CHECK(m, *offp, sizeof(struct tcphdr), IPPROTO_DONE);
 
 	/*
 	 * draft-itojun-ipv6-tcp-to-anycast
@@ -584,16 +546,17 @@ tcp6_input(struct mbuf **mp, int *offp, int proto)
 	ip6 = mtod(m, struct ip6_hdr *);
 	ia6 = in6ifa_ifwithaddr(&ip6->ip6_dst, 0 /* XXX */);
 	if (ia6 && (ia6->ia6_flags & IN6_IFF_ANYCAST)) {
+		struct ip6_hdr *ip6;
+
 		ifa_free(&ia6->ia_ifa);
+		ip6 = mtod(m, struct ip6_hdr *);
 		icmp6_error(m, ICMP6_DST_UNREACH, ICMP6_DST_UNREACH_ADDR,
 			    (caddr_t)&ip6->ip6_dst - (caddr_t)ip6);
-		*mp = NULL;
 		return (IPPROTO_DONE);
 	}
 	if (ia6)
 		ifa_free(&ia6->ia_ifa);
 
-	*mp = m;
 	return (tcp_input(mp, offp, proto));
 }
 #endif /* INET6 */
@@ -612,7 +575,6 @@ tcp_input(struct mbuf **mp, int *offp, int proto)
 	int optlen = 0;
 #ifdef INET
 	int len;
-	uint8_t ipttl;
 #endif
 	int tlen = 0, off;
 	int drop_hdrlen;
@@ -628,6 +590,7 @@ tcp_input(struct mbuf **mp, int *offp, int proto)
 #endif /* INET6 */
 	struct tcpopt to;		/* options in this segment */
 	char *s = NULL;			/* address and port logging */
+	int ti_locked;
 #ifdef TCPDEBUG
 	/*
 	 * The size of tcp_saveipgen must be the size of the max ip header,
@@ -637,8 +600,6 @@ tcp_input(struct mbuf **mp, int *offp, int proto)
 	struct tcphdr tcp_savetcp;
 	short ostate = 0;
 #endif
-
-	NET_EPOCH_ASSERT();
 
 #ifdef INET6
 	isipv6 = (mtod(m, struct ip *)->ip_v == 6) ? 1 : 0;
@@ -652,6 +613,16 @@ tcp_input(struct mbuf **mp, int *offp, int proto)
 
 #ifdef INET6
 	if (isipv6) {
+		/* IP6_EXTHDR_CHECK() is already done at tcp6_input(). */
+
+		if (m->m_len < (sizeof(*ip6) + sizeof(*th))) {
+			m = m_pullup(m, sizeof(*ip6) + sizeof(*th));
+			if (m == NULL) {
+				TCPSTAT_INC(tcps_rcvshort);
+				return (IPPROTO_DONE);
+			}
+		}
+
 		ip6 = mtod(m, struct ip6_hdr *);
 		th = (struct tcphdr *)((caddr_t)ip6 + off0);
 		tlen = sizeof(*ip6) + ntohs(ip6->ip6_plen) - off0;
@@ -725,7 +696,6 @@ tcp_input(struct mbuf **mp, int *offp, int proto)
 			 * Checksum extended TCP header and data.
 			 */
 			len = off0 + tlen;
-			ipttl = ip->ip_ttl;
 			bzero(ipov->ih_x1, sizeof(ipov->ih_x1));
 			ipov->ih_len = htons(tlen);
 			th->th_sum = in_cksum(m, len);
@@ -734,9 +704,7 @@ tcp_input(struct mbuf **mp, int *offp, int proto)
 			/* Reset TOS bits */
 			ip->ip_tos = iptos;
 			/* Re-initialization for later version check */
-			ip->ip_ttl = ipttl;
 			ip->ip_v = IPVERSION;
-			ip->ip_hl = off0 >> 2;
 		}
 
 		if (th->th_sum) {
@@ -759,13 +727,7 @@ tcp_input(struct mbuf **mp, int *offp, int proto)
 	if (off > sizeof (struct tcphdr)) {
 #ifdef INET6
 		if (isipv6) {
-			if (m->m_len < off0 + off) {
-				m = m_pullup(m, off0 + off);
-				if (m == NULL) {
-					TCPSTAT_INC(tcps_rcvshort);
-					return (IPPROTO_DONE);
-				}
-			}
+			IP6_EXTHDR_CHECK(m, off0, off, IPPROTO_DONE);
 			ip6 = mtod(m, struct ip6_hdr *);
 			th = (struct tcphdr *)((caddr_t)ip6 + off0);
 		}
@@ -802,6 +764,19 @@ tcp_input(struct mbuf **mp, int *offp, int proto)
 	drop_hdrlen = off0 + off;
 
 	/*
+	 * Locate pcb for segment; if we're likely to add or remove a
+	 * connection then first acquire pcbinfo lock.  There are three cases
+	 * where we might discover later we need a write lock despite the
+	 * flags: ACKs moving a connection out of the syncache, ACKs for a
+	 * connection in TIMEWAIT and SYNs not targeting a listening socket.
+	 */
+	if ((thflags & (TH_FIN | TH_RST)) != 0) {
+		INP_INFO_RLOCK(&V_tcbinfo);
+		ti_locked = TI_RLOCKED;
+	} else
+		ti_locked = TI_UNLOCKED;
+
+	/*
 	 * Grab info from PACKET_TAG_IPFORWARD tag prepended to the chain.
 	 */
         if (
@@ -818,6 +793,13 @@ tcp_input(struct mbuf **mp, int *offp, int proto)
 		fwd_tag = m_tag_find(m, PACKET_TAG_IPFORWARD, NULL);
 
 findpcb:
+#ifdef INVARIANTS
+	if (ti_locked == TI_RLOCKED) {
+		INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
+	} else {
+		INP_INFO_UNLOCK_ASSERT(&V_tcbinfo);
+	}
+#endif
 #ifdef INET6
 	if (isipv6 && fwd_tag != NULL) {
 		struct sockaddr_in6 *next_hop6;
@@ -893,8 +875,8 @@ findpcb:
 		 * Log communication attempts to ports that are not
 		 * in use.
 		 */
-		if ((V_tcp_log_in_vain == 1 && (thflags & TH_SYN)) ||
-		    V_tcp_log_in_vain == 2) {
+		if ((tcp_log_in_vain == 1 && (thflags & TH_SYN)) ||
+		    tcp_log_in_vain == 2) {
 			if ((s = tcp_log_vain(NULL, th, (void *)ip, ip6)))
 				log(LOG_INFO, "%s; %s: Connection attempt "
 				    "to closed port\n", s, __func__);
@@ -976,7 +958,28 @@ findpcb:
 	 *
 	 * XXXRW: It may be time to rethink timewait locking.
 	 */
+relocked:
 	if (inp->inp_flags & INP_TIMEWAIT) {
+		if (ti_locked == TI_UNLOCKED) {
+			if (INP_INFO_TRY_RLOCK(&V_tcbinfo) == 0) {
+				in_pcbref(inp);
+				INP_WUNLOCK(inp);
+				INP_INFO_RLOCK(&V_tcbinfo);
+				ti_locked = TI_RLOCKED;
+				INP_WLOCK(inp);
+				if (in_pcbrele_wlocked(inp)) {
+					inp = NULL;
+					goto findpcb;
+				} else if (inp->inp_flags & INP_DROPPED) {
+					INP_WUNLOCK(inp);
+					inp = NULL;
+					goto findpcb;
+				}
+			} else
+				ti_locked = TI_RLOCKED;
+		}
+		INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
+
 		if (thflags & TH_SYN)
 			tcp_dooptions(&to, optp, optlen, TO_SYN);
 		/*
@@ -984,6 +987,7 @@ findpcb:
 		 */
 		if (tcp_twcheck(inp, &to, th, m, tlen))
 			goto findpcb;
+		INP_INFO_RUNLOCK(&V_tcbinfo);
 		return (IPPROTO_DONE);
 	}
 	/*
@@ -1004,6 +1008,42 @@ findpcb:
 		goto dropunlock;
 	}
 #endif
+
+	/*
+	 * We've identified a valid inpcb, but it could be that we need an
+	 * inpcbinfo write lock but don't hold it.  In this case, attempt to
+	 * acquire using the same strategy as the TIMEWAIT case above.  If we
+	 * relock, we have to jump back to 'relocked' as the connection might
+	 * now be in TIMEWAIT.
+	 */
+#ifdef INVARIANTS
+	if ((thflags & (TH_FIN | TH_RST)) != 0)
+		INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
+#endif
+	if (!((tp->t_state == TCPS_ESTABLISHED && (thflags & TH_SYN) == 0) ||
+	      (tp->t_state == TCPS_LISTEN && (thflags & TH_SYN) &&
+	       !IS_FASTOPEN(tp->t_flags)))) {
+		if (ti_locked == TI_UNLOCKED) {
+			if (INP_INFO_TRY_RLOCK(&V_tcbinfo) == 0) {
+				in_pcbref(inp);
+				INP_WUNLOCK(inp);
+				INP_INFO_RLOCK(&V_tcbinfo);
+				ti_locked = TI_RLOCKED;
+				INP_WLOCK(inp);
+				if (in_pcbrele_wlocked(inp)) {
+					inp = NULL;
+					goto findpcb;
+				} else if (inp->inp_flags & INP_DROPPED) {
+					INP_WUNLOCK(inp);
+					inp = NULL;
+					goto findpcb;
+				}
+				goto relocked;
+			} else
+				ti_locked = TI_RLOCKED;
+		}
+		INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
+	}
 
 #ifdef MAC
 	INP_WLOCK_ASSERT(inp);
@@ -1038,8 +1078,6 @@ findpcb:
 #ifdef INET6
 		if (isipv6) {
 			inc.inc_flags |= INC_ISIPV6;
-			if (inp->inp_inc.inc_flags & INC_IPV6MINMTU)
-				inc.inc_flags |= INC_IPV6MINMTU;
 			inc.inc6_faddr = ip6->ip6_src;
 			inc.inc6_laddr = ip6->ip6_dst;
 		} else
@@ -1058,6 +1096,8 @@ findpcb:
 		 * socket appended to the listen queue in SYN_RECEIVED state.
 		 */
 		if ((thflags & (TH_RST|TH_ACK|TH_SYN)) == TH_ACK) {
+
+			INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
 			/*
 			 * Parse the TCP options here because
 			 * syncookies need access to the reflected
@@ -1087,7 +1127,9 @@ findpcb:
 				rstreason = BANDLIM_RST_OPENPORT;
 				goto dropwithreset;
 			}
+#ifdef TCP_RFC7413
 tfo_socket_result:
+#endif
 			if (so == NULL) {
 				/*
 				 * We completed the 3-way handshake
@@ -1132,9 +1174,9 @@ tfo_socket_result:
 			 * contains.  tcp_do_segment() consumes
 			 * the mbuf chain and unlocks the inpcb.
 			 */
-			TCP_PROBE5(receive, NULL, tp, m, tp, th);
 			tp->t_fb->tfb_tcp_do_segment(m, th, so, tp, drop_hdrlen, tlen,
-			    iptos);
+			    iptos, ti_locked);
+			INP_INFO_UNLOCK_ASSERT(&V_tcbinfo);
 			return (IPPROTO_DONE);
 		}
 		/*
@@ -1148,7 +1190,7 @@ tfo_socket_result:
 		 * causes.
 		 */
 		if (thflags & TH_RST) {
-			syncache_chkrst(&inc, th, m);
+			syncache_chkrst(&inc, th);
 			goto dropunlock;
 		}
 		/*
@@ -1330,14 +1372,21 @@ tfo_socket_result:
 #endif
 		TCP_PROBE3(debug__input, tp, th, m);
 		tcp_dooptions(&to, optp, optlen, TO_SYN);
-		if (syncache_add(&inc, &to, th, inp, &so, m, NULL, NULL, iptos))
+#ifdef TCP_RFC7413
+		if (syncache_add(&inc, &to, th, inp, &so, m, NULL, NULL))
 			goto tfo_socket_result;
-
+#else
+		syncache_add(&inc, &to, th, inp, &so, m, NULL, NULL);
+#endif
 		/*
 		 * Entry added to syncache and mbuf consumed.
 		 * Only the listen socket is unlocked by syncache_add().
 		 */
-		INP_INFO_WUNLOCK_ASSERT(&V_tcbinfo);
+		if (ti_locked == TI_RLOCKED) {
+			INP_INFO_RUNLOCK(&V_tcbinfo);
+			ti_locked = TI_UNLOCKED;
+		}
+		INP_INFO_UNLOCK_ASSERT(&V_tcbinfo);
 		return (IPPROTO_DONE);
 	} else if (tp->t_state == TCPS_LISTEN) {
 		/*
@@ -1368,11 +1417,24 @@ tfo_socket_result:
 	 * state.  tcp_do_segment() always consumes the mbuf chain, unlocks
 	 * the inpcb, and unlocks pcbinfo.
 	 */
-	tp->t_fb->tfb_tcp_do_segment(m, th, so, tp, drop_hdrlen, tlen, iptos);
+	tp->t_fb->tfb_tcp_do_segment(m, th, so, tp, drop_hdrlen, tlen, iptos, ti_locked);
+	INP_INFO_UNLOCK_ASSERT(&V_tcbinfo);
 	return (IPPROTO_DONE);
 
 dropwithreset:
 	TCP_PROBE5(receive, NULL, tp, m, tp, th);
+
+	if (ti_locked == TI_RLOCKED) {
+		INP_INFO_RUNLOCK(&V_tcbinfo);
+		ti_locked = TI_UNLOCKED;
+	}
+#ifdef INVARIANTS
+	else {
+		KASSERT(ti_locked == TI_UNLOCKED, ("%s: dropwithreset "
+		    "ti_locked: %d", __func__, ti_locked));
+		INP_INFO_UNLOCK_ASSERT(&V_tcbinfo);
+	}
+#endif
 
 	if (inp != NULL) {
 		tcp_dropwithreset(m, th, tp, tlen, rstreason);
@@ -1386,11 +1448,23 @@ dropunlock:
 	if (m != NULL)
 		TCP_PROBE5(receive, NULL, tp, m, tp, th);
 
+	if (ti_locked == TI_RLOCKED) {
+		INP_INFO_RUNLOCK(&V_tcbinfo);
+		ti_locked = TI_UNLOCKED;
+	}
+#ifdef INVARIANTS
+	else {
+		KASSERT(ti_locked == TI_UNLOCKED, ("%s: dropunlock "
+		    "ti_locked: %d", __func__, ti_locked));
+		INP_INFO_UNLOCK_ASSERT(&V_tcbinfo);
+	}
+#endif
+
 	if (inp != NULL)
 		INP_WUNLOCK(inp);
 
 drop:
-	INP_INFO_WUNLOCK_ASSERT(&V_tcbinfo);
+	INP_INFO_UNLOCK_ASSERT(&V_tcbinfo);
 	if (s != NULL)
 		free(s, M_TCPLOG);
 	if (m != NULL)
@@ -1419,16 +1493,13 @@ drop:
  * The criteria to step up the receive buffer one notch are:
  *  1. Application has not set receive buffer size with
  *     SO_RCVBUF. Setting SO_RCVBUF clears SB_AUTOSIZE.
- *  2. the number of bytes received during 1/2 of an sRTT
- *     is at least 3/8 of the current socket buffer size.
- *  3. receive buffer size has not hit maximal automatic size;
+ *  2. the number of bytes received during the time it takes
+ *     one timestamp to be reflected back to us (the RTT);
+ *  3. received bytes per RTT is within seven eighth of the
+ *     current socket buffer size;
+ *  4. receive buffer size has not hit maximal automatic size;
  *
- * If all of the criteria are met we increaset the socket buffer
- * by a 1/2 (bounded by the max). This allows us to keep ahead
- * of slow-start but also makes it so our peer never gets limited
- * by our rwnd which we then open up causing a burst.
- *
- * This algorithm does two steps per RTT at most and only if
+ * This algorithm does one step per RTT at most and only if
  * we receive a bulk stream w/o packet losses or reorderings.
  * Shrinking the buffer during idle times is not necessary as
  * it doesn't consume any memory when idle.
@@ -1445,10 +1516,11 @@ tcp_autorcvbuf(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	if (V_tcp_do_autorcvbuf && (so->so_rcv.sb_flags & SB_AUTOSIZE) &&
 	    tp->t_srtt != 0 && tp->rfbuf_ts != 0 &&
 	    TCP_TS_TO_TICKS(tcp_ts_getticks() - tp->rfbuf_ts) >
-	    ((tp->t_srtt >> TCP_RTT_SHIFT)/2)) {
-		if (tp->rfbuf_cnt > ((so->so_rcv.sb_hiwat / 2)/ 4 * 3) &&
+	    (tp->t_srtt >> TCP_RTT_SHIFT)) {
+		if (tp->rfbuf_cnt > (so->so_rcv.sb_hiwat / 8 * 7) &&
 		    so->so_rcv.sb_hiwat < V_tcp_autorcvbuf_max) {
-			newsize = min((so->so_rcv.sb_hiwat + (so->so_rcv.sb_hiwat/2)), V_tcp_autorcvbuf_max);
+			newsize = min(so->so_rcv.sb_hiwat +
+			    V_tcp_autorcvbuf_inc, V_tcp_autorcvbuf_max);
 		}
 		TCP_PROBE6(receive__autoresize, NULL, tp, m, tp, th, newsize);
 
@@ -1458,23 +1530,27 @@ tcp_autorcvbuf(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	} else {
 		tp->rfbuf_cnt += tlen;	/* add up */
 	}
+
 	return (newsize);
 }
 
 void
 tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
-    struct tcpcb *tp, int drop_hdrlen, int tlen, uint8_t iptos)
+    struct tcpcb *tp, int drop_hdrlen, int tlen, uint8_t iptos,
+    int ti_locked)
 {
 	int thflags, acked, ourfinisacked, needoutput = 0, sack_changed;
-	int rstreason, todrop, win, incforsyn = 0;
+	int rstreason, todrop, win;
 	uint32_t tiwin;
 	uint16_t nsegs;
 	char *s;
 	struct in_conninfo *inc;
 	struct mbuf *mfree;
 	struct tcpopt to;
+#ifdef TCP_RFC7413
 	int tfo_syn;
-
+#endif
+	
 #ifdef TCPDEBUG
 	/*
 	 * The size of tcp_saveipgen must be the size of the max ip header,
@@ -1490,7 +1566,28 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	sack_changed = 0;
 	nsegs = max(1, m->m_pkthdr.lro_nsegs);
 
-	NET_EPOCH_ASSERT();
+	/*
+	 * If this is either a state-changing packet or current state isn't
+	 * established, we require a write lock on tcbinfo.  Otherwise, we
+	 * allow the tcbinfo to be in either alocked or unlocked, as the
+	 * caller may have unnecessarily acquired a write lock due to a race.
+	 */
+	if ((thflags & (TH_SYN | TH_FIN | TH_RST)) != 0 ||
+	    tp->t_state != TCPS_ESTABLISHED) {
+		KASSERT(ti_locked == TI_RLOCKED, ("%s ti_locked %d for "
+		    "SYN/FIN/RST/!EST", __func__, ti_locked));
+		INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
+	} else {
+#ifdef INVARIANTS
+		if (ti_locked == TI_RLOCKED)
+			INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
+		else {
+			KASSERT(ti_locked == TI_UNLOCKED, ("%s: EST "
+			    "ti_locked: %d", __func__, ti_locked));
+			INP_INFO_UNLOCK_ASSERT(&V_tcbinfo);
+		}
+#endif
+	}
 	INP_WLOCK_ASSERT(tp->t_inpcb);
 	KASSERT(tp->t_state > TCPS_LISTEN, ("%s: TCPS_LISTEN",
 	    __func__));
@@ -1501,8 +1598,6 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	/* Save segment, if requested. */
 	tcp_pcap_add(th, m, &(tp->t_inpkts));
 #endif
-	TCP_LOG_EVENT(tp, th, &so->so_rcv, &so->so_snd, TCP_LOG_IN, 0,
-	    tlen, NULL, true);
 
 	if ((thflags & TH_SYN) && (thflags & TH_FIN) && V_drop_synfin) {
 		if ((s = tcp_log_addrs(inc, th, NULL, NULL))) {
@@ -1537,21 +1632,16 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	 * For the SYN_SENT state the scale is zero.
 	 */
 	tiwin = th->th_win << tp->snd_scale;
-#ifdef STATS
-	stats_voi_update_abs_ulong(tp->t_stats, VOI_TCP_FRWIN, tiwin);
-#endif
 
 	/*
 	 * TCP ECN processing.
 	 */
-	if (tp->t_flags2 & TF2_ECN_PERMIT) {
-		if (thflags & TH_CWR) {
-			tp->t_flags2 &= ~TF2_ECN_SND_ECE;
-			tp->t_flags |= TF_ACKNOW;
-		}
+	if (tp->t_flags & TF_ECN_PERMIT) {
+		if (thflags & TH_CWR)
+			tp->t_flags &= ~TF_ECN_SND_ECE;
 		switch (iptos & IPTOS_ECN_MASK) {
 		case IPTOS_ECN_CE:
-			tp->t_flags2 |= TF2_ECN_SND_ECE;
+			tp->t_flags |= TF_ECN_SND_ECE;
 			TCPSTAT_INC(tcps_ecn_ce);
 			break;
 		case IPTOS_ECN_ECT0:
@@ -1595,9 +1685,6 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 		to.to_tsecr -= tp->ts_offset;
 		if (TSTMP_GT(to.to_tsecr, tcp_ts_getticks()))
 			to.to_tsecr = 0;
-		else if (tp->t_flags & TF_PREVVALID &&
-			 tp->t_badrxtwin != 0 && SEQ_LT(to.to_tsecr, tp->t_badrxtwin))
-			cc_cong_signal(tp, th, CC_RTO_ERR);
 	}
 	/*
 	 * Process options only when we get SYN/ACK back. The SYN case
@@ -1607,53 +1694,26 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	 * XXX this is traditional behavior, may need to be cleaned up.
 	 */
 	if (tp->t_state == TCPS_SYN_SENT && (thflags & TH_SYN)) {
-		/* Handle parallel SYN for ECN */
-		if (!(thflags & TH_ACK) &&
-		    ((thflags & (TH_CWR | TH_ECE)) == (TH_CWR | TH_ECE)) &&
-		    ((V_tcp_do_ecn == 1) || (V_tcp_do_ecn == 2))) {
-			tp->t_flags2 |= TF2_ECN_PERMIT;
-			tp->t_flags2 |= TF2_ECN_SND_ECE;
-			TCPSTAT_INC(tcps_ecn_shs);
-		}
 		if ((to.to_flags & TOF_SCALE) &&
 		    (tp->t_flags & TF_REQ_SCALE)) {
 			tp->t_flags |= TF_RCVD_SCALE;
 			tp->snd_scale = to.to_wscale;
-		} else
-			tp->t_flags &= ~TF_REQ_SCALE;
+		}
 		/*
 		 * Initial send window.  It will be updated with
 		 * the next incoming segment to the scaled value.
 		 */
 		tp->snd_wnd = th->th_win;
-		if ((to.to_flags & TOF_TS) &&
-		    (tp->t_flags & TF_REQ_TSTMP)) {
+		if (to.to_flags & TOF_TS) {
 			tp->t_flags |= TF_RCVD_TSTMP;
 			tp->ts_recent = to.to_tsval;
 			tp->ts_recent_age = tcp_ts_getticks();
-		} else
-			tp->t_flags &= ~TF_REQ_TSTMP;
+		}
 		if (to.to_flags & TOF_MSS)
 			tcp_mss(tp, to.to_mss);
 		if ((tp->t_flags & TF_SACK_PERMIT) &&
 		    (to.to_flags & TOF_SACKPERM) == 0)
 			tp->t_flags &= ~TF_SACK_PERMIT;
-		if (IS_FASTOPEN(tp->t_flags)) {
-			if (to.to_flags & TOF_FASTOPEN) {
-				uint16_t mss;
-
-				if (to.to_flags & TOF_MSS)
-					mss = to.to_mss;
-				else
-					if ((tp->t_inpcb->inp_vflag & INP_IPV6) != 0)
-						mss = TCP6_MSS;
-					else
-						mss = TCP_MSS;
-				tcp_fastopen_update_cache(tp, mss,
-				    to.to_tfo_len, to.to_tfo_cookie);
-			} else
-				tcp_fastopen_disable_path(tp);
-		}
 	}
 
 	/*
@@ -1696,11 +1756,12 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	    th->th_seq == tp->rcv_nxt &&
 	    (thflags & (TH_SYN|TH_FIN|TH_RST|TH_URG|TH_ACK)) == TH_ACK &&
 	    tp->snd_nxt == tp->snd_max &&
-	    tiwin && tiwin == tp->snd_wnd &&
+	    tiwin && tiwin == tp->snd_wnd && 
 	    ((tp->t_flags & (TF_NEEDSYN|TF_NEEDFIN)) == 0) &&
-	    SEGQ_EMPTY(tp) &&
+	    LIST_EMPTY(&tp->t_segq) &&
 	    ((to.to_flags & TOF_TS) == 0 ||
 	     TSTMP_GEQ(to.to_tsval, tp->ts_recent)) ) {
+
 		/*
 		 * If last ACK falls within this segment's sequence numbers,
 		 * record the timestamp.
@@ -1722,13 +1783,16 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 				/*
 				 * This is a pure ack for outstanding data.
 				 */
+				if (ti_locked == TI_RLOCKED)
+					INP_INFO_RUNLOCK(&V_tcbinfo);
+				ti_locked = TI_UNLOCKED;
+
 				TCPSTAT_INC(tcps_predack);
 
 				/*
-				 * "bad retransmit" recovery without timestamps.
+				 * "bad retransmit" recovery.
 				 */
-				if ((to.to_flags & TOF_TS) == 0 &&
-				    tp->t_rxtshift == 1 &&
+				if (tp->t_rxtshift == 1 &&
 				    tp->t_flags & TF_PREVVALID &&
 				    (int)(ticks - tp->t_badrxtwin) < 0) {
 					cc_cong_signal(tp, th, CC_RTO_ERR);
@@ -1772,7 +1836,7 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 				if (SEQ_GT(tp->snd_una, tp->snd_recover) &&
 				    SEQ_LEQ(th->th_ack, tp->snd_recover))
 					tp->snd_recover = th->th_ack - 1;
-
+				
 				/*
 				 * Let the congestion control algorithm update
 				 * congestion control related information. This
@@ -1825,20 +1889,15 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 			 * nothing on the reassembly queue and we have enough
 			 * buffer space to take it.
 			 */
+			if (ti_locked == TI_RLOCKED)
+				INP_INFO_RUNLOCK(&V_tcbinfo);
+			ti_locked = TI_UNLOCKED;
+
 			/* Clean receiver SACK report if present */
 			if ((tp->t_flags & TF_SACK_PERMIT) && tp->rcv_numsacks)
 				tcp_clean_sackreport(tp);
 			TCPSTAT_INC(tcps_preddat);
 			tp->rcv_nxt += tlen;
-			if (tlen &&
-			    ((tp->t_flags2 & TF2_FBYTES_COMPLETE) == 0) &&
-			    (tp->t_fbyte_in == 0)) {
-				tp->t_fbyte_in = ticks;
-				if (tp->t_fbyte_in == 0)
-					tp->t_fbyte_in = 1;
-				if (tp->t_fbyte_out && tp->t_fbyte_in)
-					tp->t_flags2 |= TF2_FBYTES_COMPLETE;
-			}
 			/*
 			 * Pull snd_wl1 up to prevent seq wrap relative to
 			 * th_seq.
@@ -1900,6 +1959,7 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	tp->rcv_wnd = imax(win, (int)(tp->rcv_adv - tp->rcv_nxt));
 
 	switch (tp->t_state) {
+
 	/*
 	 * If the state is SYN_RECEIVED:
 	 *	if seg contains an ACK, but not for our SYN/ACK, send a RST.
@@ -1911,6 +1971,7 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 				rstreason = BANDLIM_RST_OPENPORT;
 				goto dropwithreset;
 		}
+#ifdef TCP_RFC7413
 		if (IS_FASTOPEN(tp->t_flags)) {
 			/*
 			 * When a TFO connection is in SYN_RECEIVED, the
@@ -1924,13 +1985,14 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 				goto dropwithreset;
 			} else if (thflags & TH_SYN) {
 				/* non-initial SYN is ignored */
-				if ((tcp_timer_active(tp, TT_DELACK) ||
+				if ((tcp_timer_active(tp, TT_DELACK) || 
 				     tcp_timer_active(tp, TT_REXMT)))
 					goto drop;
 			} else if (!(thflags & (TH_ACK|TH_FIN|TH_RST))) {
 				goto drop;
 			}
 		}
+#endif
 		break;
 
 	/*
@@ -1962,8 +2024,6 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 		tp->irs = th->th_seq;
 		tcp_rcvseqinit(tp);
 		if (thflags & TH_ACK) {
-			int tfo_partial_ack = 0;
-
 			TCPSTAT_INC(tcps_connects);
 			soisconnected(so);
 #ifdef MAC
@@ -1978,30 +2038,20 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 			    TCP_MAXWIN << tp->rcv_scale);
 			tp->snd_una++;		/* SYN is acked */
 			/*
-			 * If not all the data that was sent in the TFO SYN
-			 * has been acked, resend the remainder right away.
-			 */
-			if (IS_FASTOPEN(tp->t_flags) &&
-			    (tp->snd_una != tp->snd_max)) {
-				tp->snd_nxt = th->th_ack;
-				tfo_partial_ack = 1;
-			}
-			/*
 			 * If there's data, delay ACK; if there's also a FIN
 			 * ACKNOW will be turned on later.
 			 */
-			if (DELAY_ACK(tp, tlen) && tlen != 0 && !tfo_partial_ack)
+			if (DELAY_ACK(tp, tlen) && tlen != 0)
 				tcp_timer_activate(tp, TT_DELACK,
 				    tcp_delacktime);
 			else
 				tp->t_flags |= TF_ACKNOW;
 
-			if (((thflags & (TH_CWR | TH_ECE)) == TH_ECE) &&
-			    (V_tcp_do_ecn == 1)) {
-				tp->t_flags2 |= TF2_ECN_PERMIT;
+			if ((thflags & TH_ECE) && V_tcp_do_ecn) {
+				tp->t_flags |= TF_ECN_PERMIT;
 				TCPSTAT_INC(tcps_ecn_shs);
 			}
-
+			
 			/*
 			 * Received <SYN,ACK> in SYN_SENT[*] state.
 			 * Transitions:
@@ -2035,6 +2085,9 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 			tcp_state_change(tp, TCPS_SYN_RECEIVED);
 		}
 
+		KASSERT(ti_locked == TI_RLOCKED, ("%s: trimthenstep6: "
+		    "ti_locked %d", __func__, ti_locked));
+		INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
 		INP_WLOCK_ASSERT(tp->t_inpcb);
 
 		/*
@@ -2106,6 +2159,11 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 		if ((SEQ_GEQ(th->th_seq, tp->last_ack_sent) &&
 		    SEQ_LT(th->th_seq, tp->last_ack_sent + tp->rcv_wnd)) ||
 		    (tp->rcv_wnd == 0 && tp->last_ack_sent == th->th_seq)) {
+
+			INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
+			KASSERT(ti_locked == TI_RLOCKED,
+			    ("%s: TH_RST ti_locked %d, th %p tp %p",
+			    __func__, ti_locked, th, tp));
 			KASSERT(tp->t_state != TCPS_SYN_SENT,
 			    ("%s: TH_RST for TCPS_SYN_SENT th %p tp %p",
 			    __func__, th, tp));
@@ -2148,6 +2206,10 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	 */
 	if ((thflags & TH_SYN) && tp->t_state != TCPS_SYN_SENT &&
 	    tp->t_state != TCPS_SYN_RECEIVED) {
+		KASSERT(ti_locked == TI_RLOCKED,
+		    ("tcp_do_segment: TH_SYN ti_locked %d", ti_locked));
+		INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
+
 		TCPSTAT_INC(tcps_badsyn);
 		if (V_tcp_insecure_syn &&
 		    SEQ_GEQ(th->th_seq, tp->last_ack_sent) &&
@@ -2170,6 +2232,7 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	 */
 	if ((to.to_flags & TOF_TS) != 0 && tp->ts_recent &&
 	    TSTMP_LT(to.to_tsval, tp->ts_recent)) {
+
 		/* Check to see if ts_recent is over 24 days old.  */
 		if (tcp_ts_getticks() - tp->ts_recent_age > TCP_PAWS_IDLE) {
 			/*
@@ -2241,18 +2304,6 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 			TCPSTAT_INC(tcps_rcvpartduppack);
 			TCPSTAT_ADD(tcps_rcvpartdupbyte, todrop);
 		}
-		/*
-		 * DSACK - add SACK block for dropped range
-		 */
-		if ((todrop > 0) && (tp->t_flags & TF_SACK_PERMIT)) {
-			tcp_update_sack_list(tp, th->th_seq,
-			    th->th_seq + todrop);
-			/*
-			 * ACK now, as the next in-sequence segment
-			 * will clear the DSACK block again
-			 */
-			tp->t_flags |= TF_ACKNOW;
-		}
 		drop_hdrlen += todrop;	/* drop from the top afterwards */
 		th->th_seq += todrop;
 		tlen -= todrop;
@@ -2270,6 +2321,10 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	 */
 	if ((so->so_state & SS_NOFDREF) &&
 	    tp->t_state > TCPS_CLOSE_WAIT && tlen) {
+		KASSERT(ti_locked == TI_RLOCKED, ("%s: SS_NOFDEREF && "
+		    "CLOSE_WAIT && tlen ti_locked %d", __func__, ti_locked));
+		INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
+
 		if ((s = tcp_log_addrs(inc, th, NULL, NULL))) {
 			log(LOG_DEBUG, "%s; %s: %s: Received %d bytes of data "
 			    "after socket was closed, "
@@ -2314,14 +2369,14 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	/*
 	 * If last ACK falls within this segment's sequence numbers,
 	 * record its timestamp.
-	 * NOTE:
+	 * NOTE: 
 	 * 1) That the test incorporates suggestions from the latest
 	 *    proposal of the tcplw@cray.com list (Braden 1993/04/26).
 	 * 2) That updating only on newer timestamps interferes with
 	 *    our earlier PAWS tests, so this check should be solely
 	 *    predicated on the sequence space of this segment.
-	 * 3) That we modify the segment boundary check to be
-	 *        Last.ACK.Sent <= SEG.SEQ + SEG.Len
+	 * 3) That we modify the segment boundary check to be 
+	 *        Last.ACK.Sent <= SEG.SEQ + SEG.Len  
 	 *    instead of RFC1323's
 	 *        Last.ACK.Sent < SEG.SEQ + SEG.Len,
 	 *    This modified check allows us to overcome RFC1323's
@@ -2345,11 +2400,13 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	if ((thflags & TH_ACK) == 0) {
 		if (tp->t_state == TCPS_SYN_RECEIVED ||
 		    (tp->t_flags & TF_NEEDSYN)) {
+#ifdef TCP_RFC7413
 			if (tp->t_state == TCPS_SYN_RECEIVED &&
 			    IS_FASTOPEN(tp->t_flags)) {
 				tp->snd_wnd = tiwin;
 				cc_conn_init(tp);
 			}
+#endif
 			goto step6;
 		} else if (tp->t_flags & TF_ACKNOW)
 			goto dropafterack;
@@ -2361,6 +2418,7 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 	 * Ack processing.
 	 */
 	switch (tp->t_state) {
+
 	/*
 	 * In SYN_RECEIVED state, the ack ACKs our SYN, so enter
 	 * ESTABLISHED state and continue processing.
@@ -2374,18 +2432,14 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 		if ((tp->t_flags & (TF_RCVD_SCALE|TF_REQ_SCALE)) ==
 			(TF_RCVD_SCALE|TF_REQ_SCALE)) {
 			tp->rcv_scale = tp->request_r_scale;
+			tp->snd_wnd = tiwin;
 		}
-		tp->snd_wnd = tiwin;
 		/*
 		 * Make transitions:
 		 *      SYN-RECEIVED  -> ESTABLISHED
 		 *      SYN-RECEIVED* -> FIN-WAIT-1
 		 */
 		tp->t_starttime = ticks;
-		if (IS_FASTOPEN(tp->t_flags) && tp->t_tfo_pending) {
-			tcp_fastopen_decrement_counter(tp->t_tfo_pending);
-			tp->t_tfo_pending = NULL;
-		}
 		if (tp->t_flags & TF_NEEDFIN) {
 			tcp_state_change(tp, TCPS_FIN_WAIT_1);
 			tp->t_flags &= ~TF_NEEDFIN;
@@ -2393,6 +2447,17 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 			tcp_state_change(tp, TCPS_ESTABLISHED);
 			TCP_PROBE5(accept__established, NULL, tp,
 			    m, tp, th);
+#ifdef TCP_RFC7413
+			if (tp->t_tfo_pending) {
+				tcp_fastopen_decrement_counter(tp->t_tfo_pending);
+				tp->t_tfo_pending = NULL;
+
+				/*
+				 * Account for the ACK of our SYN prior to
+				 * regular ACK processing below.
+				 */ 
+				tp->snd_una++;
+			}
 			/*
 			 * TFO connections call cc_conn_init() during SYN
 			 * processing.  Calling it again here for such
@@ -2401,22 +2466,16 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 			 * is retransmitted.
 			 */
 			if (!IS_FASTOPEN(tp->t_flags))
+#endif
 				cc_conn_init(tp);
 			tcp_timer_activate(tp, TT_KEEP, TP_KEEPIDLE(tp));
 		}
-		/*
-		 * Account for the ACK of our SYN prior to
-		 * regular ACK processing below, except for
-		 * simultaneous SYN, which is handled later.
-		 */
-		if (SEQ_GT(th->th_ack, tp->snd_una) && !(tp->t_flags & TF_NEEDSYN))
-			incforsyn = 1;
 		/*
 		 * If segment contains data or ACK, will call tcp_reass()
 		 * later; if not, do so now to pass queued data to user.
 		 */
 		if (tlen == 0 && (thflags & TH_FIN) == 0)
-			(void) tcp_reass(tp, (struct tcphdr *)0, NULL, 0,
+			(void) tcp_reass(tp, (struct tcphdr *)0, 0,
 			    (struct mbuf *)0);
 		tp->snd_wl1 = th->th_seq - 1;
 		/* FALLTHROUGH */
@@ -2525,10 +2584,10 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 					if ((tp->t_flags & TF_SACK_PERMIT) &&
 					    IN_FASTRECOVERY(tp->t_flags)) {
 						int awnd;
-
+						
 						/*
 						 * Compute the amount of data in flight first.
-						 * We can inject new data into the pipe iff
+						 * We can inject new data into the pipe iff 
 						 * we have less than 1/2 the original window's
 						 * worth of data in flight.
 						 */
@@ -2578,7 +2637,7 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 					if (tp->t_flags & TF_SACK_PERMIT) {
 						TCPSTAT_INC(
 						    tcps_sack_recovery_episode);
-						tp->snd_recover = tp->snd_nxt;
+						tp->sack_newdata = tp->snd_nxt;
 						tp->snd_cwnd = maxseg;
 						(void) tp->t_fb->tfb_tcp_output(tp);
 						goto drop;
@@ -2658,16 +2717,9 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 			tp->t_dupacks = 0;
 			/*
 			 * If this ack also has new SACK info, increment the
-			 * counter as per rfc6675. The variable
-			 * sack_changed tracks all changes to the SACK
-			 * scoreboard, including when partial ACKs without
-			 * SACK options are received, and clear the scoreboard
-			 * from the left side. Such partial ACKs should not be
-			 * counted as dupacks here.
+			 * counter as per rfc6675.
 			 */
-			if ((tp->t_flags & TF_SACK_PERMIT) &&
-			    (to.to_flags & TOF_SACK) &&
-			    sack_changed)
+			if ((tp->t_flags & TF_SACK_PERMIT) && sack_changed)
 				tp->t_dupacks++;
 		}
 
@@ -2712,15 +2764,6 @@ tcp_do_segment(struct mbuf *m, struct tcphdr *th, struct socket *so,
 process_ACK:
 		INP_WLOCK_ASSERT(tp->t_inpcb);
 
-		/*
-		 * Adjust for the SYN bit in sequence space,
-		 * but don't account for it in cwnd calculations.
-		 * This is for the SYN_RECEIVED, non-simultaneous
-		 * SYN case. SYN_SENT and simultaneous SYN are
-		 * treated elsewhere.
-		 */
-		if (incforsyn)
-			tp->snd_una++;
 		acked = BYTES_THIS_ACK(tp, th);
 		KASSERT(acked >= 0, ("%s: acked unexepectedly negative "
 		    "(tp->snd_una=%u, th->th_ack=%u, tp=%p, m=%p)", __func__,
@@ -2735,10 +2778,8 @@ process_ACK:
 		 * original cwnd and ssthresh, and proceed to transmit where
 		 * we left off.
 		 */
-		if (tp->t_rxtshift == 1 &&
-		    tp->t_flags & TF_PREVVALID &&
-		    tp->t_badrxtwin &&
-		    SEQ_LT(to.to_tsecr, tp->t_badrxtwin))
+		if (tp->t_rxtshift == 1 && tp->t_flags & TF_PREVVALID &&
+		    (int)(ticks - tp->t_badrxtwin) < 0)
 			cc_cong_signal(tp, th, CC_RTO_ERR);
 
 		/*
@@ -2833,6 +2874,7 @@ process_ACK:
 			tp->snd_nxt = tp->snd_una;
 
 		switch (tp->t_state) {
+
 		/*
 		 * In FIN_WAIT_1 STATE in addition to the processing
 		 * for the ESTABLISHED state if our FIN is now acknowledged
@@ -2870,7 +2912,9 @@ process_ACK:
 		 */
 		case TCPS_CLOSING:
 			if (ourfinisacked) {
+				INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
 				tcp_twstart(tp);
+				INP_INFO_RUNLOCK(&V_tcbinfo);
 				m_freem(m);
 				return;
 			}
@@ -2884,6 +2928,7 @@ process_ACK:
 		 */
 		case TCPS_LAST_ACK:
 			if (ourfinisacked) {
+				INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
 				tp = tcp_close(tp);
 				goto drop;
 			}
@@ -2987,13 +3032,15 @@ dodata:							/* XXX */
 	 * case PRU_RCVD).  If a FIN has already been received on this
 	 * connection then we just ignore the text.
 	 */
+#ifdef TCP_RFC7413
 	tfo_syn = ((tp->t_state == TCPS_SYN_RECEIVED) &&
 		   IS_FASTOPEN(tp->t_flags));
-	if ((tlen || (thflags & TH_FIN) || (tfo_syn && tlen > 0)) &&
+#else
+#define	tfo_syn	(false)
+#endif
+	if ((tlen || (thflags & TH_FIN) || tfo_syn) &&
 	    TCPS_HAVERCVDFIN(tp->t_state) == 0) {
 		tcp_seq save_start = th->th_seq;
-		tcp_seq save_rnxt  = tp->rcv_nxt;
-		int     save_tlen  = tlen;
 		m_adj(m, drop_hdrlen);	/* delayed header drop */
 		/*
 		 * Insert segment which includes th into TCP reassembly queue
@@ -3008,7 +3055,7 @@ dodata:							/* XXX */
 		 * fast retransmit can work).
 		 */
 		if (th->th_seq == tp->rcv_nxt &&
-		    SEGQ_EMPTY(tp) &&
+		    LIST_EMPTY(&tp->t_segq) &&
 		    (TCPS_HAVEESTABLISHED(tp->t_state) ||
 		     tfo_syn)) {
 			if (DELAY_ACK(tp, tlen) || tfo_syn)
@@ -3016,15 +3063,6 @@ dodata:							/* XXX */
 			else
 				tp->t_flags |= TF_ACKNOW;
 			tp->rcv_nxt += tlen;
-			if (tlen &&
-			    ((tp->t_flags2 & TF2_FBYTES_COMPLETE) == 0) &&
-			    (tp->t_fbyte_in == 0)) {
-				tp->t_fbyte_in = ticks;
-				if (tp->t_fbyte_in == 0)
-					tp->t_fbyte_in = 1;
-				if (tp->t_fbyte_out && tp->t_fbyte_in)
-					tp->t_flags2 |= TF2_FBYTES_COMPLETE;
-			}
 			thflags = th->th_flags & TH_FIN;
 			TCPSTAT_INC(tcps_rcvpack);
 			TCPSTAT_ADD(tcps_rcvbyte, tlen);
@@ -3042,41 +3080,11 @@ dodata:							/* XXX */
 			 * m_adj() doesn't actually frees any mbufs
 			 * when trimming from the head.
 			 */
-			tcp_seq temp = save_start;
-			thflags = tcp_reass(tp, th, &temp, &tlen, m);
+			thflags = tcp_reass(tp, th, &tlen, m);
 			tp->t_flags |= TF_ACKNOW;
 		}
-		if ((tp->t_flags & TF_SACK_PERMIT) && (save_tlen > 0)) {
-			if ((tlen == 0) && (SEQ_LT(save_start, save_rnxt))) {
-				/*
-				 * DSACK actually handled in the fastpath
-				 * above.
-				 */
-				tcp_update_sack_list(tp, save_start,
-				    save_start + save_tlen);
-			} else if ((tlen > 0) && SEQ_GT(tp->rcv_nxt, save_rnxt)) {
-				if ((tp->rcv_numsacks >= 1) &&
-				    (tp->sackblks[0].end == save_start)) {
-					/*
-					 * Partial overlap, recorded at todrop
-					 * above.
-					 */
-					tcp_update_sack_list(tp,
-					    tp->sackblks[0].start,
-					    tp->sackblks[0].end);
-				} else {
-					tcp_update_dsack_list(tp, save_start,
-					    save_start + save_tlen);
-				}
-			} else if (tlen >= save_tlen) {
-				/* Update of sackblks. */
-				tcp_update_dsack_list(tp, save_start,
-				    save_start + save_tlen);
-			} else if (tlen > 0) {
-				tcp_update_dsack_list(tp, save_start,
-				    save_start + tlen);
-			}
-		}
+		if (tlen > 0 && (tp->t_flags & TF_SACK_PERMIT))
+			tcp_update_sack_list(tp, save_start, save_start + tlen);
 #if 0
 		/*
 		 * Note the amount of data that peer has sent into
@@ -3115,6 +3123,7 @@ dodata:							/* XXX */
 			tp->rcv_nxt++;
 		}
 		switch (tp->t_state) {
+
 		/*
 		 * In SYN_RECEIVED and ESTABLISHED STATES
 		 * enter the CLOSE_WAIT state.
@@ -3140,10 +3149,20 @@ dodata:							/* XXX */
 		 * standard timers.
 		 */
 		case TCPS_FIN_WAIT_2:
+			INP_INFO_RLOCK_ASSERT(&V_tcbinfo);
+			KASSERT(ti_locked == TI_RLOCKED, ("%s: dodata "
+			    "TCP_FIN_WAIT_2 ti_locked: %d", __func__,
+			    ti_locked));
+
 			tcp_twstart(tp);
+			INP_INFO_RUNLOCK(&V_tcbinfo);
 			return;
 		}
 	}
+	if (ti_locked == TI_RLOCKED)
+		INP_INFO_RUNLOCK(&V_tcbinfo);
+	ti_locked = TI_UNLOCKED;
+
 #ifdef TCPDEBUG
 	if (so->so_options & SO_DEBUG)
 		tcp_trace(TA_INPUT, ostate, tp, (void *)tcp_saveipgen,
@@ -3158,6 +3177,9 @@ dodata:							/* XXX */
 		(void) tp->t_fb->tfb_tcp_output(tp);
 
 check_delack:
+	KASSERT(ti_locked == TI_UNLOCKED, ("%s: check_delack ti_locked %d",
+	    __func__, ti_locked));
+	INP_INFO_UNLOCK_ASSERT(&V_tcbinfo);
 	INP_WLOCK_ASSERT(tp->t_inpcb);
 
 	if (tp->t_flags & TF_DELACK) {
@@ -3195,6 +3217,10 @@ dropafterack:
 			  &tcp_savetcp, 0);
 #endif
 	TCP_PROBE3(debug__input, tp, th, m);
+	if (ti_locked == TI_RLOCKED)
+		INP_INFO_RUNLOCK(&V_tcbinfo);
+	ti_locked = TI_UNLOCKED;
+
 	tp->t_flags |= TF_ACKNOW;
 	(void) tp->t_fb->tfb_tcp_output(tp);
 	INP_WUNLOCK(tp->t_inpcb);
@@ -3202,6 +3228,10 @@ dropafterack:
 	return;
 
 dropwithreset:
+	if (ti_locked == TI_RLOCKED)
+		INP_INFO_RUNLOCK(&V_tcbinfo);
+	ti_locked = TI_UNLOCKED;
+
 	if (tp != NULL) {
 		tcp_dropwithreset(m, th, tp, tlen, rstreason);
 		INP_WUNLOCK(tp->t_inpcb);
@@ -3210,6 +3240,15 @@ dropwithreset:
 	return;
 
 drop:
+	if (ti_locked == TI_RLOCKED) {
+		INP_INFO_RUNLOCK(&V_tcbinfo);
+		ti_locked = TI_UNLOCKED;
+	}
+#ifdef INVARIANTS
+	else
+		INP_INFO_UNLOCK_ASSERT(&V_tcbinfo);
+#endif
+
 	/*
 	 * Drop space held by incoming segment and return.
 	 */
@@ -3222,6 +3261,9 @@ drop:
 	if (tp != NULL)
 		INP_WUNLOCK(tp->t_inpcb);
 	m_freem(m);
+#ifndef TCP_RFC7413
+#undef	tfo_syn
+#endif
 }
 
 /*
@@ -3375,21 +3417,21 @@ tcp_dooptions(struct tcpopt *to, u_char *cp, int cnt, int flags)
 			to->to_sacks = cp + 2;
 			TCPSTAT_INC(tcps_sack_rcv_blocks);
 			break;
+#ifdef TCP_RFC7413
 		case TCPOPT_FAST_OPEN:
-			/*
-			 * Cookie length validation is performed by the
-			 * server side cookie checking code or the client
-			 * side cookie cache update code.
-			 */
+			if ((optlen != TCPOLEN_FAST_OPEN_EMPTY) &&
+			    (optlen < TCPOLEN_FAST_OPEN_MIN) &&
+			    (optlen > TCPOLEN_FAST_OPEN_MAX))
+				continue;
 			if (!(flags & TO_SYN))
 				continue;
-			if (!V_tcp_fastopen_client_enable &&
-			    !V_tcp_fastopen_server_enable)
+			if (!V_tcp_fastopen_enabled)
 				continue;
 			to->to_flags |= TOF_FASTOPEN;
 			to->to_tfo_len = optlen - 2;
 			to->to_tfo_cookie = to->to_tfo_len ? cp + 2 : NULL;
 			break;
+#endif
 		default:
 			continue;
 		}
@@ -3444,10 +3486,6 @@ tcp_xmit_timer(struct tcpcb *tp, int rtt)
 
 	TCPSTAT_INC(tcps_rttupdated);
 	tp->t_rttupdated++;
-#ifdef STATS
-	stats_voi_update_abs_u32(tp->t_stats, VOI_TCP_RTT,
-	    imax(0, rtt * 1000 / hz));
-#endif
 	if ((tp->t_srtt != 0) && (tp->t_rxtshift <= TCP_RTT_INVALIDATE)) {
 		/*
 		 * srtt is stored as fixed point with 5 bits after the
@@ -3800,6 +3838,7 @@ tcp_mssopt(struct in_conninfo *inc)
 	return (mss);
 }
 
+
 /*
  * On a partial ack arrives, force the retransmission of the
  * next unacknowledged segment.  Do not clear tp->t_dupacks.
@@ -3845,31 +3884,4 @@ tcp_compute_pipe(struct tcpcb *tp)
 	return (tp->snd_max - tp->snd_una +
 		tp->sackhint.sack_bytes_rexmit -
 		tp->sackhint.sacked_bytes);
-}
-
-uint32_t
-tcp_compute_initwnd(uint32_t maxseg)
-{
-	/*
-	 * Calculate the Initial Window, also used as Restart Window
-	 *
-	 * RFC5681 Section 3.1 specifies the default conservative values.
-	 * RFC3390 specifies slightly more aggressive values.
-	 * RFC6928 increases it to ten segments.
-	 * Support for user specified value for initial flight size.
-	 */
-	if (V_tcp_initcwnd_segments)
-		return min(V_tcp_initcwnd_segments * maxseg,
-		    max(2 * maxseg, V_tcp_initcwnd_segments * 1460));
-	else if (V_tcp_do_rfc3390)
-		return min(4 * maxseg, max(2 * maxseg, 4380));
-	else {
-		/* Per RFC5681 Section 3.1 */
-		if (maxseg > 2190)
-			return (2 * maxseg);
-		else if (maxseg > 1095)
-			return (3 * maxseg);
-		else
-			return (4 * maxseg);
-	}
 }
